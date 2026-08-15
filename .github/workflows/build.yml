@@ -16,6 +16,11 @@ on:
         required: false
         default: "release"
         type: string
+      flutter_version:
+        description: "Pin versi Flutter. Default 3.41.9 (versi stabil terakhir sebelum breaking change IconData final di 3.44.0). Kosongkan kalau mau ikut stable terbaru (berisiko error mendadak saat Flutter update)."
+        required: false
+        default: "3.41.9"
+        type: string
 
 jobs:
   build:
@@ -36,19 +41,35 @@ jobs:
         uses: subosito/flutter-action@v2
         with:
           channel: "stable"
+          flutter-version: ${{ github.event.inputs.flutter_version || '' }}
+          cache: true
+
+      - name: Cek dulu apakah tag release memang ada
+        env:
+          GH_TOKEN: ${{ secrets.BOT_PAT }}
+        run: |
+          set -euo pipefail
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "❌ GH_TOKEN KOSONG. Secret BOT_PAT gak ketemu / belum di-set di repo ini."
+            exit 1
+          fi
+          if ! gh release view "${{ github.event.inputs.tag }}" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            echo "❌ Release dengan tag '${{ github.event.inputs.tag }}' tidak ditemukan di repo ini."
+            echo "   Buat dulu release-nya sebelum menjalankan workflow ini."
+            exit 1
+          fi
+          echo "✅ Release tag ditemukan, lanjut."
+
+      - name: Flutter doctor (buat diagnosa kalau ada masalah environment)
+        run: flutter doctor -v
 
       - name: Download project zip
         env:
           GH_TOKEN: ${{ secrets.BOT_PAT }}
         run: |
-          if [ -z "$GH_TOKEN" ]; then
-            echo "❌ GH_TOKEN KOSONG. Secret BOT_PAT gak ketemu / belum di-set di repo ini."
-            exit 1
-          else
-            echo "✅ GH_TOKEN ada isinya, panjang: ${#GH_TOKEN} karakter"
-          fi
+          set -euo pipefail
 
-          curl -L \
+          curl -fL --retry 3 --retry-delay 5 --retry-connrefused \
             -H "Authorization: Bearer $GH_TOKEN" \
             -H "Accept: application/octet-stream" \
             "${{ github.event.inputs.zip_url }}" \
@@ -58,9 +79,9 @@ jobs:
           ls -lh project.zip
           file project.zip
 
-          if file project.zip | grep -q "JSON"; then
-            echo "❌ Bukan file zip, ini isi response-nya:"
-            cat project.zip
+          if file project.zip | grep -qi "JSON\|HTML\|ASCII text"; then
+            echo "❌ Bukan file zip, ini isi response-nya (500 karakter pertama):"
+            head -c 500 project.zip
             exit 1
           fi
 
@@ -70,22 +91,50 @@ jobs:
       - name: Cari folder pubspec.yaml
         id: findroot
         run: |
-          ROOT=$(dirname "$(find project -maxdepth 3 -name pubspec.yaml | head -n1)")
+          set -euo pipefail
+          PUBSPEC=$(find project -maxdepth 3 -name pubspec.yaml | head -n1)
+          if [ -z "$PUBSPEC" ]; then
+            echo "❌ pubspec.yaml tidak ditemukan di dalam zip. Struktur folder project salah/tidak lengkap."
+            find project -maxdepth 3
+            exit 1
+          fi
+          ROOT=$(dirname "$PUBSPEC")
+          echo "✅ Project root: $ROOT"
           echo "root=$ROOT" >> "$GITHUB_OUTPUT"
 
-      - name: Flutter pub get
+      - name: Flutter pub get (coba dulu apa adanya, tanpa modifikasi apapun)
+        id: pubget
+        continue-on-error: true
         working-directory: ${{ steps.findroot.outputs.root }}
         run: |
+          set -euo pipefail
           rm -f android/local.properties
           flutter pub get
 
-      - name: Bump compileSdk/targetSdk ke 36 jika perlu
+      - name: Bump compileSdk/targetSdk ke 36 jika perlu (dengan cek AGP)
         working-directory: ${{ steps.findroot.outputs.root }}
         run: |
+          set -euo pipefail
           GRADLE_FILE="android/app/build.gradle.kts"
+          SETTINGS_FILE="android/settings.gradle.kts"
+
           if [ -f "$GRADLE_FILE" ]; then
             echo "🔧 compileSdk sebelum:"
             grep -n "compileSdk" "$GRADLE_FILE" || true
+
+            # Cek versi Android Gradle Plugin dulu, SDK 36 butuh AGP minimal 8.5
+            if [ -f "$SETTINGS_FILE" ] && grep -q "com.android.application" "$SETTINGS_FILE"; then
+              AGP_VERSION=$(grep "com.android.application" "$SETTINGS_FILE" | grep -oE "[0-9]+\.[0-9]+\.[0-9]+" | head -n1 || true)
+              if [ -n "$AGP_VERSION" ]; then
+                AGP_MAJOR=$(echo "$AGP_VERSION" | cut -d. -f1)
+                AGP_MINOR=$(echo "$AGP_VERSION" | cut -d. -f2)
+                if [ "$AGP_MAJOR" -lt 8 ] || { [ "$AGP_MAJOR" -eq 8 ] && [ "$AGP_MINOR" -lt 5 ]; }; then
+                  echo "⚠️  AGP versi $AGP_VERSION terdeteksi terlalu lama untuk compileSdk 36 (butuh >= 8.5.0)."
+                  echo "⚠️  Melewati bump SDK supaya tidak bikin build gagal. Update AGP dulu kalau memang perlu SDK 36."
+                  exit 0
+                fi
+              fi
+            fi
 
             sed -i -E 's/compileSdk\s*=\s*[0-9]+/compileSdk = 36/' "$GRADLE_FILE"
             sed -i -E 's/compileSdk\s+[0-9]+/compileSdk 36/' "$GRADLE_FILE"
@@ -94,33 +143,203 @@ jobs:
 
             echo "🔧 compileSdk sesudah:"
             grep -n "compileSdk\|targetSdk" "$GRADLE_FILE" || true
+          else
+            echo "ℹ️  $GRADLE_FILE tidak ada, skip."
           fi
 
-      - name: Fix font_awesome_flutter incompatibility
+      - name: Fix font_awesome_flutter incompatibility (HANYA jika pub get di atas gagal)
+        if: steps.pubget.outcome == 'failure'
         working-directory: ${{ steps.findroot.outputs.root }}
         run: |
-          if grep -q "font_awesome_flutter" pubspec.yaml; then
-            echo "🔧 Upgrade font_awesome_flutter ke versi kompatibel..."
+          set -euo pipefail
+
+          if ! grep -q "font_awesome_flutter" pubspec.yaml; then
+            echo "❌ pub get gagal, tapi font_awesome_flutter tidak dipakai di project ini."
+            echo "   Penyebab gagalnya bukan itu, jalankan 'flutter pub get' manual untuk lihat errornya:"
+            flutter pub get
+            exit 1
+          fi
+
+          echo "🔧 Backup lib/ sebelum patch, buat jaga-jaga rollback..."
+          cp -r lib lib.bak
+
+          echo "🔧 Upgrade font_awesome_flutter ke versi kompatibel..."
+          flutter pub upgrade font_awesome_flutter --major-versions
+
+          echo "🔧 Pass 1: bungkus Icon(...FontAwesomeIcons...) -> FaIcon(...)..."
+          PATCHED_FILES=()
+          for f in $(find lib -name "*.dart"); do
+            before=$(grep -c "FaIcon(" "$f" || true)
+            perl -0777 -pi -e 's/\bIcon\(([\s\S]{0,60}?)(FontAwesomeIcons\.)/FaIcon($1$2/g' "$f"
+            after=$(grep -c "FaIcon(" "$f" || true)
+            if [ "$after" -gt "$before" ]; then
+              echo "  ✅ $f: $((after - before)) Icon->FaIcon patch"
+              PATCHED_FILES+=("$f")
+            fi
+          done
+
+          echo "🔧 Pass 2: tambah .data untuk pemakaian FontAwesomeIcons.xxx mentah (bukan di dalam FaIcon(...))..."
+          echo "   (sejak font_awesome_flutter 11.x, FaIconData sudah tidak bisa dipakai langsung sebagai IconData)"
+          for f in $(find lib -name "*.dart"); do
+            if grep -q "FontAwesomeIcons\." "$f"; then
+              before_data=$(grep -oc "FontAwesomeIcons\.\w*\.data" "$f" || true)
+              perl -0777 -pi -e '
+                # Lindungi dulu pemakaian yang sudah benar (FaIcon(FontAwesomeIcons.xxx) -> jadi token sementara tanpa titik
+                s/(FaIcon\(\s*)FontAwesomeIcons\.(\w+)/$1FA_PROTECTED_TOKEN_$2/g;
+                # Tambahkan .data ke semua sisa pemakaian mentah yang belum punya .data
+                s/FontAwesomeIcons\.(\w+)(?!\.data)/FontAwesomeIcons.$1.data/g;
+                # Kembalikan token yang dilindungi tadi ke bentuk semula (tanpa .data)
+                s/FA_PROTECTED_TOKEN_(\w+)/FontAwesomeIcons.$1/g;
+              ' "$f"
+              after_data=$(grep -oc "FontAwesomeIcons\.\w*\.data" "$f" || true)
+              if [ "$after_data" -gt "$before_data" ]; then
+                echo "  ✅ $f: $((after_data - before_data)) .data patch"
+                PATCHED_FILES+=("$f")
+              fi
+            fi
+          done
+
+          # Hilangkan duplikat di daftar file yang dipatch
+          if [ "${#PATCHED_FILES[@]}" -gt 0 ]; then
+            mapfile -t PATCHED_FILES < <(printf '%s\n' "${PATCHED_FILES[@]}" | sort -u)
+          fi
+
+          echo "🔍 Cek sisa penggunaan FontAwesomeIcons yang masih pakai Icon( biasa:"
+          grep -rn "Icon(" lib --include="*.dart" -A5 | grep -B5 "FontAwesomeIcons\." || echo "  (tidak ada, aman)"
+
+          if [ "${#PATCHED_FILES[@]}" -gt 0 ]; then
+            echo "🔍 Validasi HANYA file yang dipatch (bukan seluruh project, biar bug lama di file lain tidak ikut menggagalkan build)..."
+            if ! flutter analyze --no-fatal-infos --no-fatal-warnings "${PATCHED_FILES[@]}" > analyze_output.txt 2>&1; then
+              echo "❌ Masih ada error di file yang dipatch setelah 2 pass otomatis ini."
+              echo "   Kasusnya kemungkinan lebih rumit dari yang bisa ditangani otomatis (mis. FontAwesomeIcons dipakai di dalam const, generic, atau helper class kustom)."
+              echo "   Perlu perbaikan manual di source code project. Detail error:"
+              cat analyze_output.txt
+              rm -rf lib
+              mv lib.bak lib
+              exit 1
+            fi
+            echo "✅ Patch valid, tidak ada error baru di file yang dipatch."
+          else
+            echo "ℹ️  Tidak ada file yang berubah dari patch."
+          fi
+          rm -rf lib.bak
+
+          echo "🔧 Coba lagi pub get setelah patch..."
+          flutter pub get
+
+      - name: Build APK (percobaan 1)
+        id: build1
+        continue-on-error: true
+        working-directory: ${{ steps.findroot.outputs.root }}
+        run: |
+          set -euo pipefail
+          flutter clean
+          flutter pub get
+
+          set +e
+          if [ "${{ github.event.inputs.build_type }}" = "debug" ]; then
+            flutter build apk --debug 2>&1 | tee build_log.txt
+          else
+            flutter build apk --release 2>&1 | tee build_log.txt
+          fi
+          BUILD_EXIT=${PIPESTATUS[0]}
+          set -e
+          exit $BUILD_EXIT
+
+      # Error macam IconData/CarouselController cuma ketahuan pas compile beneran,
+      # jadi baru dideteksi & difix di sini kalau percobaan 1 di atas gagal.
+      - name: Deteksi & fix error kompatibilitas Flutter SDK (HANYA jika percobaan 1 gagal)
+        if: steps.build1.outcome == 'failure'
+        working-directory: ${{ steps.findroot.outputs.root }}
+        run: |
+          set -euo pipefail
+          LOG="build_log.txt"
+          FIXED=false
+
+          if grep -q "can't be extended outside of its library because it's a final class" "$LOG" && grep -qi "font_awesome_flutter" "$LOG"; then
+            echo "🔎 Terdeteksi: font_awesome_flutter versi lama tidak kompatibel dengan IconData final di Flutter SDK ini."
+            cp -r lib lib.bak
+
             flutter pub upgrade font_awesome_flutter --major-versions
 
-            echo "🔧 Patch pemakaian Icon(...) -> FaIcon(...) untuk FontAwesomeIcons (mode aman)..."
+            PATCHED_FILES=()
             for f in $(find lib -name "*.dart"); do
               before=$(grep -c "FaIcon(" "$f" || true)
-              # Radius diperketat lagi ke 60 karakter untuk hindari salah tembak lintas-widget
               perl -0777 -pi -e 's/\bIcon\(([\s\S]{0,60}?)(FontAwesomeIcons\.)/FaIcon($1$2/g' "$f"
               after=$(grep -c "FaIcon(" "$f" || true)
-              if [ "$after" -gt "$before" ]; then
-                echo "  ✅ $f: $((after - before)) patch diterapkan"
+              [ "$after" -gt "$before" ] && PATCHED_FILES+=("$f")
+            done
+            for f in $(find lib -name "*.dart"); do
+              if grep -q "FontAwesomeIcons\." "$f"; then
+                before_data=$(grep -oc "FontAwesomeIcons\.\w*\.data" "$f" || true)
+                perl -0777 -pi -e '
+                  s/(FaIcon\(\s*)FontAwesomeIcons\.(\w+)/$1FA_PROTECTED_TOKEN_$2/g;
+                  s/FontAwesomeIcons\.(\w+)(?!\.data)/FontAwesomeIcons.$1.data/g;
+                  s/FA_PROTECTED_TOKEN_(\w+)/FontAwesomeIcons.$1/g;
+                ' "$f"
+                after_data=$(grep -oc "FontAwesomeIcons\.\w*\.data" "$f" || true)
+                [ "$after_data" -gt "$before_data" ] && PATCHED_FILES+=("$f")
               fi
             done
-
-            echo "🔍 Cek sisa penggunaan FontAwesomeIcons yang masih pakai Icon( biasa:"
-            grep -rn "Icon(" lib --include="*.dart" -A5 | grep -B5 "FontAwesomeIcons\." || echo "  (tidak ada, aman)"
+            if [ "${#PATCHED_FILES[@]}" -gt 0 ]; then
+              mapfile -t PATCHED_FILES < <(printf '%s\n' "${PATCHED_FILES[@]}" | sort -u)
+              echo "🔍 Validasi file yang dipatch..."
+              if ! flutter analyze --no-fatal-infos --no-fatal-warnings "${PATCHED_FILES[@]}" > analyze_output.txt 2>&1; then
+                echo "❌ Patch font_awesome_flutter masih menyisakan error. Rollback."
+                cat analyze_output.txt
+                rm -rf lib && mv lib.bak lib
+                exit 1
+              fi
+              echo "✅ Patch font_awesome_flutter valid: ${#PATCHED_FILES[@]} file diubah."
+            fi
+            rm -rf lib.bak
+            FIXED=true
           fi
 
-      - name: Build APK
+          if grep -q "CarouselController' is imported from both" "$LOG"; then
+            echo "🔎 Terdeteksi: carousel_slider versi lama bentrok dengan CarouselController bawaan Flutter SDK ini."
+            echo "   (Bug ini sudah ada sejak Flutter 3.24 dan diperbaiki upstream mulai carousel_slider versi 5.x)"
+            cp -r lib lib.bak.cs
+
+            flutter pub upgrade carousel_slider --major-versions
+
+            echo "🔧 Best-effort rename parameter lama 'carouselController:' -> 'controller:' (nama baru di versi 5.x)"
+            PATCHED_CS_FILES=()
+            for f in $(find lib -name "*.dart"); do
+              if grep -q "carouselController\s*:" "$f"; then
+                sed -i -E 's/\bcarouselController(\s*):/controller\1:/g' "$f"
+                PATCHED_CS_FILES+=("$f")
+              fi
+            done
+            if [ "${#PATCHED_CS_FILES[@]}" -gt 0 ]; then
+              echo "🔍 Validasi file yang dipatch carousel_slider..."
+              if ! flutter analyze --no-fatal-infos --no-fatal-warnings "${PATCHED_CS_FILES[@]}" > analyze_cs_output.txt 2>&1; then
+                echo "❌ Patch carousel_slider masih menyisakan error (kemungkinan ada perubahan API lain di v5.x selain rename parameter). Rollback."
+                cat analyze_cs_output.txt
+                rm -rf lib && mv lib.bak.cs lib
+                exit 1
+              fi
+              echo "✅ Patch carousel_slider valid: ${#PATCHED_CS_FILES[@]} file diubah."
+            fi
+            rm -rf lib.bak.cs
+            FIXED=true
+          fi
+
+          if [ "$FIXED" = false ]; then
+            echo "❌ Build gagal karena error yang polanya tidak dikenali oleh auto-fix ini."
+            echo "   Ini perlu dicek manual. Log lengkap build:"
+            cat "$LOG"
+            exit 1
+          fi
+
+          echo "🔧 pub get ulang setelah fix..."
+          flutter pub get
+
+      - name: Build APK (percobaan 2, setelah auto-fix)
+        if: steps.build1.outcome == 'failure'
         working-directory: ${{ steps.findroot.outputs.root }}
         run: |
+          set -euo pipefail
           if [ "${{ github.event.inputs.build_type }}" = "debug" ]; then
             flutter build apk --debug
           else
@@ -131,13 +350,21 @@ jobs:
         id: findapk
         working-directory: ${{ steps.findroot.outputs.root }}
         run: |
+          set -euo pipefail
           APK_PATH=$(find build/app/outputs/flutter-apk -name "*.apk" | head -n1)
+          if [ -z "$APK_PATH" ]; then
+            echo "❌ Tidak ada file APK yang ditemukan setelah build. Build kemungkinan gagal diam-diam."
+            find build/app/outputs -maxdepth 3 2>/dev/null || echo "  (folder outputs juga tidak ada)"
+            exit 1
+          fi
+          echo "✅ APK ditemukan: $APK_PATH"
           echo "apk_path=$APK_PATH" >> "$GITHUB_OUTPUT"
 
       - name: Upload APK ke Release (pakai tag yang dikirim)
         env:
           GH_TOKEN: ${{ secrets.BOT_PAT }}
         run: |
+          set -euo pipefail
           gh release upload "${{ github.event.inputs.tag }}" \
             "${{ steps.findroot.outputs.root }}/${{ steps.findapk.outputs.apk_path }}" \
             --clobber \
