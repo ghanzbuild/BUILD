@@ -1,0 +1,187 @@
+name: Build Android Java/Kotlin APK
+
+on:
+workflow_dispatch:
+inputs:
+zip_url:
+description: "URL zip project Android/Java (asset dari release)"
+required: true
+type: string
+tag:
+description: "Tag release tujuan upload hasil build"
+required: true
+type: string
+build_type:
+description: "Jenis build: release atau debug"
+required: false
+default: "release"
+type: choice
+options:
+- release
+- debug
+java_version:
+description: "Versi Java/JDK"
+required: false
+default: "17"
+type: string
+
+jobs:
+build:
+runs-on: ubuntu-latest
+
+permissions:
+  contents: write
+
+steps:
+  - name: Checkout repo
+    uses: actions/checkout@v4
+
+  - name: Setup Java
+    uses: actions/setup-java@v4
+    with:
+      distribution: temurin
+      java-version: ${{ github.event.inputs.java_version }}
+      cache: gradle
+
+  - name: Setup Android SDK
+    uses: android-actions/setup-android@v3
+
+  - name: Cek release
+    env:
+      GH_TOKEN: ${{ secrets.BOT_PAT }}
+    run: |
+      set -euo pipefail
+
+      if [ -z "${GH_TOKEN:-}" ]; then
+        echo "❌ BOT_PAT belum diatur."
+        exit 1
+      fi
+
+      if ! gh release view "${{ github.event.inputs.tag }}" \
+        --repo "${{ github.repository }}" >/dev/null 2>&1; then
+        echo "❌ Release '${{ github.event.inputs.tag }}' tidak ditemukan."
+        exit 1
+      fi
+
+      echo "✅ Release ditemukan."
+
+  - name: Download project ZIP
+    env:
+      GH_TOKEN: ${{ secrets.BOT_PAT }}
+    run: |
+      set -euo pipefail
+
+      curl -fL --retry 3 --retry-delay 5 --retry-connrefused \
+        -H "Authorization: Bearer $GH_TOKEN" \
+        -H "Accept: application/octet-stream" \
+        "${{ github.event.inputs.zip_url }}" \
+        -o project.zip
+
+      echo "Ukuran ZIP:"
+      ls -lh project.zip
+
+      file project.zip
+
+      if file project.zip | grep -qiE "JSON|HTML|ASCII text"; then
+        echo "❌ File yang didownload bukan ZIP."
+        head -c 500 project.zip
+        exit 1
+      fi
+
+      mkdir -p project
+      unzip -q project.zip -d project
+
+  - name: Cari Gradle project
+    id: findroot
+    run: |
+      set -euo pipefail
+
+      GRADLEW=$(find project -maxdepth 4 -type f -name "gradlew" | head -n1)
+
+      if [ -z "$GRADLEW" ]; then
+        echo "❌ gradlew tidak ditemukan."
+        echo "Project harus berupa Android/Gradle project."
+        find project -maxdepth 4 -type f | head -100
+        exit 1
+      fi
+
+      ROOT=$(dirname "$GRADLEW")
+
+      echo "✅ Gradle project ditemukan:"
+      echo "$ROOT"
+
+      echo "root=$ROOT" >> "$GITHUB_OUTPUT"
+
+  - name: Siapkan Gradle
+    working-directory: ${{ steps.findroot.outputs.root }}
+    run: |
+      set -euo pipefail
+
+      chmod +x gradlew
+
+      rm -f local.properties
+
+      ./gradlew --version
+
+  - name: Build APK Debug
+    id: build_debug
+    if: github.event.inputs.build_type == 'debug'
+    continue-on-error: true
+    working-directory: ${{ steps.findroot.outputs.root }}
+    run: |
+      set -euo pipefail
+
+      ./gradlew clean
+      ./gradlew assembleDebug --stacktrace
+
+  - name: Build APK Release
+    id: build_release
+    if: github.event.inputs.build_type == 'release'
+    continue-on-error: true
+    working-directory: ${{ steps.findroot.outputs.root }}
+    run: |
+      set -euo pipefail
+
+      ./gradlew clean
+      ./gradlew assembleRelease --stacktrace
+
+  - name: Cek hasil build
+    id: findapk
+    working-directory: ${{ steps.findroot.outputs.root }}
+    run: |
+      set -euo pipefail
+
+      APK_PATH=$(find . -type f -path "*/build/outputs/apk/*.apk" | head -n1)
+
+      if [ -z "$APK_PATH" ]; then
+        echo "❌ APK tidak ditemukan."
+        echo "Struktur output:"
+        find . -path "*/build/outputs/*" -type f 2>/dev/null || true
+        exit 1
+      fi
+
+      echo "✅ APK ditemukan:"
+      echo "$APK_PATH"
+
+      echo "apk_path=$APK_PATH" >> "$GITHUB_OUTPUT"
+
+  - name: Upload APK ke GitHub Release
+    env:
+      GH_TOKEN: ${{ secrets.BOT_PAT }}
+    run: |
+      set -euo pipefail
+
+      gh release upload \
+        "${{ github.event.inputs.tag }}" \
+        "${{ steps.findroot.outputs.root }}/${{ steps.findapk.outputs.apk_path }}" \
+        --clobber \
+        --repo "${{ github.repository }}"
+
+      echo "✅ APK berhasil diupload ke Release."
+
+  - name: Upload APK sebagai Artifact
+    uses: actions/upload-artifact@v4
+    with:
+      name: android-${{ github.event.inputs.build_type }}-apk
+      path: ${{ steps.findroot.outputs.root }}/${{ steps.findapk.outputs.apk_path }}
+      if-no-files-found: error
